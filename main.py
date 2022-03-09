@@ -1,5 +1,3 @@
-from email import message
-from statistics import mode
 import requests
 from database import get_database_connection
 import flask
@@ -7,12 +5,29 @@ from flask import render_template, redirect, url_for
 import time, os
 from datetime import datetime as dt, timedelta
 from flask import request
+from fng_index.CNNFearAndGreedIndex import CNNFearAndGreedIndex
 from helper_functions import parse_csv
-from constants import DATABASE, GURUFOCUS_TOKEN
+from constants import (
+    DATABASE,
+    FG_BUY_THRESHOLD_1,
+    FG_BUY_RANGE_1_START,
+    FG_BUY_RANGE_1_END,
+    FG_BUY_RANGE_2_START,
+    FG_BUY_RANGE_2_END,
+    MEAN_DAYS,
+    EUWAX_MIN_VALUE,
+    EUWAX_MAX_VALUE,
+    VIX_THRESHOLD,
+    SELL_FG_MAX_VALUE,
+    SELL_FG_RANGE_START,
+    SELL_FG_RANGE_END,
+    EUWAX_SELL_THRESHOLD
+    )
 
 import json
-import yahoo_fin.stock_info as si
+# import yahoo_fin.stock_info as si
 
+import scrapers
 
 app = flask.Flask(__name__, static_url_path='',
             static_folder='static',
@@ -29,11 +44,13 @@ def get_stock_rsi_settings():
     if(not bool(settings)):
         settings = {
             'id': 0,
-            'days_period_RSL': 130,
-            'moving_average_TSI': 29,
+            'days_period_RSL': 10,
+            'moving_average_TSI': 10,
             'reported_days': 100,
-            'yahoo_price_data_days': 300,
-            'gurufocus_price_data_days': 300
+            'yahoo_price_data_days': 400,
+            'gurufocus_price_data_days': 300,
+            'euwax_url': 'https://www.onvista.de/onvista/times+sales/popup/historische-kurse/?notationId=60782956&dateStart=START_DATE&interval=Y5&assetName=EUWAX%20SENTIMENT%20%20AVERAGE%2012M&exchange=Stuttgart',
+            'vix_url': 'https://de.investing.com/indices/volatility-s-p-500-historical-data'
         }
     else:
         settings = settings[0]
@@ -42,6 +59,13 @@ def get_stock_rsi_settings():
 
 
 @app.route("/")
+def dashboard():
+    return render_template(
+        'dashboard.html'
+    )
+
+
+@app.route("/import")
 def csv_index():
     allow_pull = False
     db_connection = get_database_connection()
@@ -159,6 +183,7 @@ def watchlist_index():
             db_connection.close()
             return redirect(url_for('watchlist_index'))
         else:
+            top_2_ranks_of_lists = []
             db_connection = get_database_connection()
             cursor = db_connection.cursor(dictionary=True)
             sql = f"SELECT * FROM {DATABASE}.watchlist"
@@ -169,28 +194,40 @@ def watchlist_index():
             cursor.execute(sql)
             top_2_ranked_data = cursor.fetchall()
             wl_ids_of_combinedTop_ranks = {i['watchlist_id'] for i in top_2_ranked_data}
-            top_2_ranks_of_combined_lists = []
-            for wl_id in wl_ids_of_combinedTop_ranks:
-                top_2_of_a_watchlist = list(filter(
-                        lambda wl_value: wl_value['watchlist_id'] == wl_id,
-                        top_2_ranked_data
-                    ))
-                # Filtering unique symbols records
-                top_2_of_a_watchlist = list({v['symbol']:v for v in top_2_of_a_watchlist}.values())
-                top_2_of_a_watchlist.sort(key=lambda x: x['tsi_mean_percentage_rank'], reverse=False)
-                top_2_ranks_of_combined_lists.append(
-                    [
-                        list(filter(
-                            lambda wl_value: wl_value['id'] == wl_id,
-                            watchlists
-                        ))[0]['name'], enumerate(top_2_of_a_watchlist if len(top_2_of_a_watchlist) < 2 else top_2_of_a_watchlist[0:2])
-                    ]
-                )
+            wl_ids_of_Top_ranks = []
+            if(len(wl_ids_of_combinedTop_ranks) > 0):
+                wl_ids_of_Top_ranks = wl_ids_of_combinedTop_ranks
+                
+            else:
+                sql = '''select * from ranks_calculations rc where 
+                    date = (select max(date) from ranks_calculations rc_max)'''
+                cursor.execute(sql)
+                top_2_ranked_data = cursor.fetchall()
+                wl_ids_of_Top_ranks = {i['watchlist_id'] for i in top_2_ranked_data}
+
+            for wl_id in wl_ids_of_Top_ranks:
+                    top_2_of_a_watchlist = list(filter(
+                            lambda wl_value: wl_value['watchlist_id'] == wl_id,
+                            top_2_ranked_data
+                        ))
+                    # Filtering unique symbols records
+                    top_2_of_a_watchlist = list({v['symbol']:v for v in top_2_of_a_watchlist}.values())
+                    top_2_of_a_watchlist.sort(key=lambda x: x['tsi_mean_percentage_rank'], reverse=False)
+                    top_2_ranks_of_lists.append(
+                        [
+                            list(filter(
+                                lambda wl_value: wl_value['id'] == wl_id,
+                                watchlists
+                            ))[0]['name'], enumerate(top_2_of_a_watchlist if len(top_2_of_a_watchlist) < 2 else top_2_of_a_watchlist[0:2])
+                        ]
+                    )
+
+            
             db_connection.close()
             return render_template(
                 "watchlistIndex.html",
                 watchlist_records=watchlists,
-                top_2_ranks_of_combined_lists=top_2_ranks_of_combined_lists
+                top_2_ranks_of_lists=top_2_ranks_of_lists
             )
     elif(request.method == 'POST'):
         db_connection = get_database_connection()
@@ -438,18 +475,27 @@ def edit_settings():
         db_connection = get_database_connection()
         cursor = db_connection.cursor(dictionary=True)
         if(int(request.form.get('id')) == 0):
-            sql = f"INSERT INTO {DATABASE}.settings (`days_period_RSL`, `moving_average_TSI`, `reported_days`, `yahoo_price_data_days`, `gurufocus_price_data_days`)"
-            sql = sql + " values(%s, %s, %s, %s, %s)"
+            sql = f"INSERT INTO {DATABASE}.settings (`days_period_RSL`, `moving_average_TSI`, `reported_days`, `yahoo_price_data_days`, `gurufocus_price_data_days`, `euwax_url`, `vix_url`)"
+            sql = sql + " values(%s, %s, %s, %s, %s, %s, %s)"
             val = (
                 int(request.form.get('days_period_RSL')),
                 int(request.form.get('moving_average_TSI')),
                 int(request.form.get('reported_days')),
                 int(request.form.get('yahoo_price_data_days')),
                 int(request.form.get('gurufocus_price_data_days')),
+                request.form.get('euwax_url'),
+                request.form.get('vix_url'),
             )
             cursor.execute(sql, val)
         else:
-            sql = f"UPDATE {DATABASE}.settings SET `days_period_RSL`={request.form.get('days_period_RSL')}, `moving_average_TSI`={request.form.get('moving_average_TSI')}, `reported_days`={request.form.get('reported_days')}, `yahoo_price_data_days`={request.form.get('yahoo_price_data_days')}, `gurufocus_price_data_days`={request.form.get('gurufocus_price_data_days')} WHERE `id`={request.form.get('id')}"
+            sql = f"UPDATE {DATABASE}.settings SET `euwax_url`='{request.form.get('euwax_url')}', \
+                `vix_url`='{request.form.get('vix_url')}',\
+                 `days_period_RSL`={request.form.get('days_period_RSL')},\
+                 `moving_average_TSI`={request.form.get('moving_average_TSI')}, `reported_days`=\
+                     {request.form.get('reported_days')}, `yahoo_price_data_days`=\
+                         {request.form.get('yahoo_price_data_days')}, `gurufocus_price_data_days`=\
+                             {request.form.get('gurufocus_price_data_days')} WHERE `id`=\
+                                 {request.form.get('id')}"
             cursor.execute(sql)
         db_connection.commit()
         db_connection.close()
@@ -466,8 +512,10 @@ def calculate_stock_rsi():
     sql = f"delete from `ranks_calculations`"
     cursor.execute(sql)
     db_connection.commit()
-    sql = f"SELECT * FROM {DATABASE}.watchlist where id in ({request.form.get('selectedWLs')})"
-
+    if(request.form.get('selectedWLs') == 'all'):
+        sql = f"SELECT * FROM {DATABASE}.watchlist"
+    else:
+        sql = f"SELECT * FROM {DATABASE}.watchlist where id in ({request.form.get('selectedWLs')})"
     cursor.execute(sql)
     watchlists = cursor.fetchall()
     calculated_list_of_tickers_of_all_watchlists = []
@@ -480,12 +528,12 @@ def calculate_stock_rsi():
             sql = f"select * from price_data pd where symbol  = '{wli['symbol']}'" # Getting all existing price data of the symbol/Ticker
             cursor.execute(sql)
             all_price_data = cursor.fetchall()
-            all_price_data_of_rsl_days = all_price_data[(len(all_price_data) - int(settings['days_period_RSL'])):]
+            all_price_data_of_rsl_days = all_price_data[(len(all_price_data) - (int(settings['reported_days']) + int(settings['days_period_RSL']) + int(settings['moving_average_TSI']))):]
             # Step 1 Calculation
             for day_price_record in all_price_data_of_rsl_days:
-                if(len(rsl_days_dates) != int(settings['days_period_RSL'])):
+                if(len(rsl_days_dates) != (int(settings['reported_days']) + int(settings['days_period_RSL']) + int(settings['moving_average_TSI']))):
                     rsl_days_dates.append(day_price_record['date'])
-                RSL_period_data = all_price_data[(all_price_data.index(day_price_record) - int(settings['days_period_RSL'])) : all_price_data.index(day_price_record) - 1]
+                RSL_period_data = all_price_data[(all_price_data.index(day_price_record) - int(settings['days_period_RSL'])) - 1: all_price_data.index(day_price_record) - 1]
                 sum_of_previous_days_prices = 0.00
                 for day_data in RSL_period_data:
                     sum_of_previous_days_prices = sum_of_previous_days_prices + float(day_data['close_price'])
@@ -503,7 +551,7 @@ def calculate_stock_rsi():
         rsl_rank_calculations = []
         for rsl_date in rsl_days_dates:
             filtered_on_day = list(filter(
-                        lambda day_value: day_value['date'] == rsl_date,
+                        lambda day_value: day_value['date'] == rsl_date and day_value['watchlist_id'] == wl['id'],
                         calculated_list_of_tickers_of_all_watchlists
                     ))
             if(len(filtered_on_day) > 1):
@@ -536,12 +584,12 @@ def calculate_stock_rsi():
                 db_connection.commit()
 
 
-    for wl in watchlists: # Iterating all watchlists
+    for wl in watchlists: # Iterating all watchlists for tsi
         sql = f"SELECT * FROM {DATABASE}.input WHERE `watchlist_id`={wl['id']}"
         cursor.execute(sql)
         wl_items = cursor.fetchall()
         for wli in wl_items:
-            for rsl_date in rsl_days_dates[len(rsl_days_dates)-int(settings['reported_days']):]:
+            for rsl_date in rsl_days_dates[len(rsl_days_dates)-((int(settings['reported_days']) + int(settings['moving_average_TSI']))):]:
                 tsi_days_sum = 0
                 sql = f"select * from ranks_calculations rc where symbol = '{wli['symbol']}' and `date`='{rsl_date.strftime('%Y-%m-%d %H:%M:%S')}'"
                 cursor.execute(sql)
@@ -558,17 +606,8 @@ def calculate_stock_rsi():
                 db_connection.commit()
 
 
-    # Ranking TSI Percentages
-    # for rsl_date in rsl_days_dates[len(rsl_days_dates)-int(settings['reported_days']):]:
-    #     sql = f"select * from ranks_calculations rc WHERE `date`='{rsl_date.strftime('%Y-%m-%d %H:%M:%S')}' order by tsi_mean_percentage desc"
-    #     cursor.execute(sql)
-    #     tsi_mean_percentages_of_day = cursor.fetchall()
-    #     for index, item in enumerate(tsi_mean_percentages_of_day):
-    #         sql = f"UPDATE {DATABASE}.ranks_calculations SET `tsi_mean_percentage_rank`={index+1} WHERE `id`={item['id']}"
-    #         cursor.execute(sql)
-    #     db_connection.commit()
-
-    for rsl_date in rsl_days_dates[len(rsl_days_dates)-int(settings['reported_days']):]:
+    
+    for rsl_date in rsl_days_dates[len(rsl_days_dates)-((int(settings['reported_days']) + int(settings['moving_average_TSI']))):]:
         for wl in watchlists:
             sql = f"select * from ranks_calculations rc WHERE watchlist_id={wl['id']} and `date`='{rsl_date.strftime('%Y-%m-%d %H:%M:%S')}' order by tsi_mean_percentage desc"
             cursor.execute(sql)
@@ -592,8 +631,7 @@ def calculate_all_stock_rsi():
     sql = f"delete from `all_ranks_calculations`"
     cursor.execute(sql)
     db_connection.commit()
-    breakpoint()
-    if(len(request.form.get('selectedWLs').split(',')) > 0):
+    if(',' in request.form.get('selectedWLs')):
         sql = f"SELECT * FROM {DATABASE}.watchlist where id in ({request.form.get('selectedWLs')})"
     else:
         sql = f"SELECT * FROM {DATABASE}.watchlist"
@@ -610,12 +648,14 @@ def calculate_all_stock_rsi():
             sql = f"select * from price_data pd where symbol  = '{wli['symbol']}'" # Getting all existing price data of the symbol/Ticker
             cursor.execute(sql)
             all_price_data = cursor.fetchall()
-            all_price_data_of_rsl_days = all_price_data[(len(all_price_data) - int(settings['days_period_RSL'])):]
+            all_price_data_of_rsl_days = all_price_data[
+                (len(all_price_data) - (int(settings['reported_days']) + int(settings['days_period_RSL']) + int(settings['moving_average_TSI'])))
+                :]
             # Step 1 Calculation
             for day_price_record in all_price_data_of_rsl_days:
-                if(len(rsl_days_dates) != int(settings['days_period_RSL'])):
+                if(len(rsl_days_dates) != (int(settings['reported_days']) + int(settings['days_period_RSL']) + int(settings['moving_average_TSI']))):
                     rsl_days_dates.append(day_price_record['date'])
-                RSL_period_data = all_price_data[(all_price_data.index(day_price_record) - int(settings['days_period_RSL'])) : all_price_data.index(day_price_record) - 1]
+                RSL_period_data = all_price_data[(all_price_data.index(day_price_record) - int(settings['days_period_RSL'])) - 1: all_price_data.index(day_price_record) - 1]
                 sum_of_previous_days_prices = 0.00
                 for day_data in RSL_period_data:
                     sum_of_previous_days_prices = sum_of_previous_days_prices + float(day_data['close_price'])
@@ -666,12 +706,14 @@ def calculate_all_stock_rsi():
             db_connection.commit()
 
 
-    for wl in watchlists: # Iterating all watchlists
+    for wl in watchlists: # Iterating all watchlists for tsi
         sql = f"SELECT * FROM {DATABASE}.input WHERE `watchlist_id`={wl['id']}"
         cursor.execute(sql)
         wl_items = cursor.fetchall()
         for wli in wl_items:
-            for rsl_date in rsl_days_dates[len(rsl_days_dates)-int(settings['reported_days']):]:
+            for rsl_date in rsl_days_dates[
+                len(rsl_days_dates)-(int(settings['reported_days']) + int(settings['moving_average_TSI']))
+                :]:
                 tsi_days_sum = 0
                 sql = f"select * from all_ranks_calculations rc where symbol = '{wli['symbol']}' and `date`='{rsl_date.strftime('%Y-%m-%d %H:%M:%S')}'"
                 cursor.execute(sql)
@@ -687,7 +729,7 @@ def calculate_all_stock_rsi():
                 cursor.execute(sql)
                 db_connection.commit()
 
-    for rsl_date in rsl_days_dates[len(rsl_days_dates)-int(settings['reported_days']):]:
+    for rsl_date in rsl_days_dates[len(rsl_days_dates)-(int(settings['reported_days']) + int(settings['moving_average_TSI'])):]:
         sql = f"select * from all_ranks_calculations rc WHERE `date`='{rsl_date.strftime('%Y-%m-%d %H:%M:%S')}' order by tsi_mean_percentage desc"
         cursor.execute(sql)
         tsi_mean_percentages_of_day = cursor.fetchall()
@@ -734,6 +776,114 @@ def view_all_calculations():
         tsi_calculations=enumerate(tsi_calculations),
         max_ranking_date=max_date['max_date']
     )
+
+
+@app.route("/api/v1/all-history-data", methods=['GET'])
+def get_all_history_data():
+    # Upudating EUWAX and VIX data
+    scrapers.pull_euwax_history_data()
+    scrapers.pull_vix_data()
+
+    data = {}
+    db_connection = get_database_connection()
+    cursor = db_connection.cursor(dictionary=True)
+    sixth_previous_month_date = dt.now() - timedelta(days=185)
+    sql = f"SELECT `value`, `created_on` from {DATABASE}.euwax WHERE created_on > '{str(sixth_previous_month_date.date())}' order by created_on ASC"
+    cursor.execute(sql)
+    euwax_data = cursor.fetchall()
+    
+    x_y_axis_data = []
+    for i in euwax_data:
+        x_y_axis_data.append(
+            {
+                "x": i['created_on'].strftime('%d, %b %Y'),
+                "y": i['value']
+            }
+        )
+    data['euwax'] = x_y_axis_data
+    data['euwax_meter'] = x_y_axis_data[-1] if len(euwax_data) > 0 else None
+
+    sql = f"SELECT `value`, `created_on` from {DATABASE}.vix WHERE created_on > '{str(sixth_previous_month_date.date())}' order by created_on ASC"
+    cursor.execute(sql)
+    de_inesting_data = cursor.fetchall()
+    x_y_axis_data = []
+    for i in de_inesting_data:
+        x_y_axis_data.append(
+            {
+                "x": i['created_on'].strftime('%d, %b %Y'),
+                "y": i['value']
+            }
+        )
+    data['vix'] = x_y_axis_data
+    data['vix_meter'] = x_y_axis_data[-1] if len(de_inesting_data) > 0 else None
+
+    sql = f"SELECT `current_value`, `created_on` from {DATABASE}.fear_greed_index WHERE created_on > '{str(sixth_previous_month_date.date())}' order by created_on ASC"
+    cursor.execute(sql)
+    fear_greed_data = cursor.fetchall()
+    x_y_axis_data = []
+    for i in fear_greed_data:
+        x_y_axis_data.append(
+            {
+                "x": i['created_on'].strftime('%d, %b %Y'),
+                "y": i['current_value']
+            }
+        )
+    data['fear_and_greed'] = x_y_axis_data
+    data['fear_and_greed_meter'] = x_y_axis_data[0]
+    cnn_fg = CNNFearAndGreedIndex()
+    data['fg_index_values'] = []
+    for fg in cnn_fg.index_summary.split('\n'):
+        data['fg_index_values'].append(
+            {
+                'day': fg.strip().split(':')[0],
+                'value': fg.strip().split(': ')[1].split(' (')[0],
+                'category': fg.strip().split(' (')[1].split(')')[0]
+            }
+        )
+    data['last_updated_on'] = cnn_fg.get_indicators_report().split('[Updated ')[-1].split(']')[0]
+    
+    # Measuring SELL and BUY lights
+    data['is_buy'] = False
+    data['is_sell'] = False
+    #Loop through the array to calculate sum of elements
+    fg_sum_last_x_days = 0
+    mean_days = MEAN_DAYS if MEAN_DAYS <= len(data['fear_and_greed']) else len(data['fear_and_greed'])
+    for i in range(1, mean_days):
+        fg_sum_last_x_days = fg_sum_last_x_days + data['fear_and_greed'][i]['y']
+    
+    #Loop through the array to calculate sum of elements
+    euwax_sum_last_x_days = 0
+    mean_days = MEAN_DAYS if MEAN_DAYS <= len(data['euwax']) else len(data['euwax'])
+    for i in range(-2, -2 - mean_days, -1):
+        euwax_sum_last_x_days = euwax_sum_last_x_days + data['euwax'][i]['y']
+
+    last_3_days_fg_avg = fg_sum_last_x_days/MEAN_DAYS
+    last_3_days_euwax_avg = euwax_sum_last_x_days/MEAN_DAYS
+    buy_rule_1 = data['fear_and_greed'][0]['y'] < FG_BUY_THRESHOLD_1
+    buy_rule_2 = data['fear_and_greed'][0]['y'] <= FG_BUY_RANGE_1_END and data['fear_and_greed'][0]['y'] >= FG_BUY_RANGE_1_START
+    buy_rule_3 = data['fear_and_greed'][0]['y'] <= FG_BUY_RANGE_2_END and data['fear_and_greed'][0]['y'] >= FG_BUY_RANGE_2_START and data['fear_and_greed'][0]['y'] > last_3_days_fg_avg
+    buy_rule_4 = data['euwax'][-1]['y'] <= EUWAX_MIN_VALUE if len(data['euwax']) > 0 else False
+    buy_rule_5 = data['euwax'][-1]['y'] >= EUWAX_MAX_VALUE and data['euwax'][-1]['y'] < last_3_days_euwax_avg if len(data['euwax']) > 0 else False
+    buy_rule_6 = data['vix'][-1]['y'] < VIX_THRESHOLD if len(data['vix']) > 0 else False
+    
+    # Applying Buy Rules
+    if(buy_rule_1 or buy_rule_2 or buy_rule_3):
+        if(buy_rule_4 or buy_rule_5):
+            if(buy_rule_6):
+                data['is_buy'] = True
+
+    
+    sell_rule_1 = data['fear_and_greed'][0]['y'] > SELL_FG_MAX_VALUE if len(data['fear_and_greed']) > 0 else False
+    sell_rule_2 = data['fear_and_greed'][0]['y'] <= SELL_FG_RANGE_END and data['fear_and_greed'][0]['y'] >= SELL_FG_RANGE_START and data['fear_and_greed'][0]['y'] <= last_3_days_fg_avg if len(data['fear_and_greed']) > 0 else False
+    sell_rule_3 = data['euwax'][-1]['y'] >= EUWAX_SELL_THRESHOLD and data['euwax'][-1]['y'] > last_3_days_euwax_avg if len(data['euwax']) > 0 else False
+    sell_rule_4 = data['vix'][-1]['y'] >= VIX_THRESHOLD if len(data['vix']) > 0 else False
+    if(sell_rule_1 or sell_rule_2 or sell_rule_3 or sell_rule_4):
+        data['is_sell'] = True
+
+    db_connection.close()
+    return json.dumps(data)
+
+
 
 
 if __name__ == '__main__':
