@@ -7,10 +7,10 @@ from fng_index.CNNFearAndGreedIndex import CNNFearAndGreedIndex
 
 
 
-SERVER = 'bittrich.org'
-DATABASE = 'd0392635'
-USERNAME = 'd0392635'
-PASSWORD = 'cubbaf-zyntu1-Juftos'
+SERVER = ''
+DATABASE = ''
+USERNAME = ''
+PASSWORD = ''
 
 
 
